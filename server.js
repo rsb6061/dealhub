@@ -1,20 +1,95 @@
 import express from "express";
-import paapi from "amazon-paapi";
+import crypto from "crypto";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const TAG = process.env.AMAZON_PARTNER_TAG; // giftjet0a-20
+const TAG = process.env.AMAZON_PARTNER_TAG;      // giftjet0a-20
 const ACCESS_KEY = process.env.AMAZON_ACCESS_KEY;
 const SECRET_KEY = process.env.AMAZON_SECRET_KEY;
 
-const client = {
-  accessKey: ACCESS_KEY,
-  secretKey: SECRET_KEY,
-  partnerTag: TAG,
-  host: "webservices.amazon.com",
-  region: "us-east-1"
-};
+const HOST = "webservices.amazon.com";
+const REGION = "us-east-1";
+const SERVICE = "ProductAdvertisingAPI";
+const TARGET = "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems";
+const ENDPOINT = `https://${HOST}/paapi5/searchitems`;
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+function amzDate(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const yyyy = date.getUTCFullYear();
+  const mm = pad(date.getUTCMonth() + 1);
+  const dd = pad(date.getUTCDate());
+  const hh = pad(date.getUTCHours());
+  const mi = pad(date.getUTCMinutes());
+  const ss = pad(date.getUTCSeconds());
+  return {
+    amzdate: `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`,
+    datestamp: `${yyyy}${mm}${dd}`
+  };
+}
+
+function hmac(key, msg) {
+  return crypto.createHmac("sha256", key).update(msg, "utf8").digest();
+}
+function sha256Hex(msg) {
+  return crypto.createHash("sha256").update(msg, "utf8").digest("hex");
+}
+
+async function signedFetch(bodyObj) {
+  if (!TAG || !ACCESS_KEY || !SECRET_KEY) {
+    throw new Error("Missing AMAZON_PARTNER_TAG / AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY");
+  }
+
+  const body = JSON.stringify(bodyObj);
+  const { amzdate, datestamp } = amzDate();
+
+  const canonicalUri = "/paapi5/searchitems";
+  const canonicalQuery = "";
+  const canonicalHeaders =
+    `content-encoding:amz-1.0\n` +
+    `content-type:application/json; charset=utf-8\n` +
+    `host:${HOST}\n` +
+    `x-amz-date:${amzdate}\n` +
+    `x-amz-target:${TARGET}\n`;
+  const signedHeaders = "content-encoding;content-type;host;x-amz-date;x-amz-target";
+  const payloadHash = sha256Hex(body);
+
+  const canonicalRequest =
+    `POST\n${canonicalUri}\n${canonicalQuery}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`;
+
+  const algorithm = "AWS4-HMAC-SHA256";
+  const credentialScope = `${datestamp}/${REGION}/${SERVICE}/aws4_request`;
+  const stringToSign =
+    `${algorithm}\n${amzdate}\n${credentialScope}\n${sha256Hex(canonicalRequest)}`;
+
+  const kDate = hmac("AWS4" + SECRET_KEY, datestamp);
+  const kRegion = hmac(kDate, REGION);
+  const kService = hmac(kRegion, SERVICE);
+  const kSigning = hmac(kService, "aws4_request");
+  const signature = crypto.createHmac("sha256", kSigning).update(stringToSign, "utf8").digest("hex");
+
+  const authorization =
+    `${algorithm} Credential=${ACCESS_KEY}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const resp = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: {
+      "content-encoding": "amz-1.0",
+      "content-type": "application/json; charset=utf-8",
+      host: HOST,
+      "x-amz-date": amzdate,
+      "x-amz-target": TARGET,
+      Authorization: authorization
+    },
+    body
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`PA-API HTTP ${resp.status}: ${text}`);
+  return JSON.parse(text);
+}
 
 function inferCategory(title = "") {
   const t = title.toLowerCase();
@@ -27,35 +102,27 @@ function inferCategory(title = "") {
   return "accessory";
 }
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
 app.get("/deals", async (req, res) => {
   try {
     const brand = String(req.query.brand || "").trim();
-    if (!brand) {
-      return res.status(400).json({ error: "brand required" });
-    }
+    if (!brand) return res.status(400).json({ error: "brand required" });
 
-    const result = await paapi.SearchItems(
-      {
-        PartnerTag: TAG,
-        PartnerType: "Associates",
-        Marketplace: "www.amazon.com",
-        Keywords: `${brand} faucet shower valve bidet lighting`,
-        ItemCount: 10,
-        Resources: [
-          "Images.Primary.Medium",
-          "ItemInfo.Title",
-          "ItemInfo.ManufactureInfo",
-          "Offers.Listings.Price"
-        ]
-      },
-      client
-    );
+    const payload = {
+      PartnerTag: TAG,
+      PartnerType: "Associates",
+      Marketplace: "www.amazon.com",
+      Keywords: `${brand} faucet shower valve bidet lighting`,
+      ItemCount: 10,
+      Resources: [
+        "Images.Primary.Medium",
+        "ItemInfo.Title",
+        "ItemInfo.ManufactureInfo",
+        "Offers.Listings.Price"
+      ]
+    };
 
-    const items = result?.SearchResult?.Items || [];
+    const data = await signedFetch(payload);
+    const items = data?.SearchResult?.Items || [];
 
     const deals = items
       .map((it) => {
@@ -88,11 +155,9 @@ app.get("/deals", async (req, res) => {
       .filter(Boolean);
 
     res.json(deals);
-  } catch (err) {
-    res.status(500).json({ error: "failed", detail: String(err) });
+  } catch (e) {
+    res.status(500).json({ error: "failed", detail: String(e.message || e) });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Deal sync service running on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Deal sync running on ${PORT}`));
