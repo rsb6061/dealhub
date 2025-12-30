@@ -1,5 +1,5 @@
 {
-  "name": "fixture-deal-sync",
+  "name": "dealhub",
   "version": "1.0.0",
   "type": "module",
   "main": "server.js",
@@ -7,6 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-  "express": "^4.19.2"
+    "express": "^4.19.2"
+  }
 }
 
